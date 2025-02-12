@@ -10,7 +10,13 @@ module OodCore
       # @param config [#to_h] the configuration for the batch connect template
       def self.build_vnc_container(config)
         context = config.to_h.symbolize_keys.reject { |k, _| k == :template }
-        
+
+        unless context.key?(:relocated_home_dir)
+          raise JobAdapterError, "You are missing the configuration 'relocated_home_dir' for a vnc_container template."
+        end
+        unless context.key?(:vnc_session_dir)
+          raise JobAdapterError, "You are missing the configuration 'vnc_session_dir' for a vnc_container template."
+        end
         unless context.key?(:container_path)
           raise JobAdapterError, "You are missing the configuration 'container_path' for a vnc_container template."
         end
@@ -30,6 +36,10 @@ module OodCore
         # @option context [#to_s] :websockify_cmd
         #   ("${WEBSOCKIFY_CMD:-/opt/websockify/run}") the path to the
         #   websockify script (assumes you don't modify `:after_script`)
+        # @option context [#to_s] :relocated_home_dir ("home") directory within
+        #   the user's home directory that will be considered the relocated one
+        # @option context [#to_s] :vnc_session_dir ("vnc") directory within
+        #   the session that will contain vnc_log and vnc_passwd
         # @option context [#to_s] :vnc_log ("vnc.log") path to vnc server log
         #   file (assumes you don't modify `:before_script` or `:after_script`)
         # @option context [#to_s] :vnc_passwd ("vnc.passwd") path to the file
@@ -65,10 +75,10 @@ module OodCore
         #   the container with VNC
         # @option context [#to_s] :container_module ("singularity") the module
         #   that loads Singularity or Apptainer with Lmod. Supports versions (i.e.
-        #   apptainer/1.10). If Singularity or Apptainer are installed at a 
+        #   apptainer/1.10). If Singularity or Apptainer are installed at a
         #   system level (i.e., no module loaded to activate), set this to an
         #   empty string.
-        # @option context [#to_s] :container_command ("singularity") the 
+        # @option context [#to_s] :container_command ("singularity") the
         #   singularity or apptainer execution command
         # @option context [#to_a] :container_start_args ([]) Additional
         #   arguements you wish to pass to the container start command.
@@ -89,6 +99,8 @@ module OodCore
           # Before running the main script, start up a VNC server and record
           # the connection information
           def before_script
+            relocated_home_dir = context.fetch(:relocated_home_dir).to_s
+            vnc_session_dir = context.fetch(:vnc_session_dir).to_s
             container_path = context.fetch(:container_path, "vnc_container.sif").to_s
             container_bindpath = context.fetch(:container_bindpath, "").to_s
 
@@ -99,9 +111,25 @@ module OodCore
               module load #{container_module}
               export #{container_command.upcase}_BINDPATH="#{container_bindpath}"
               export INSTANCE_NAME="#{@instance_name}"
-              export instance_name="#{@instance_name}"
               echo "Starting instance..."
               #{container_command} instance start #{container_start_args} #{container_path} #{@instance_name}
+
+              # Bind relocated home directory
+              export #{container_command.upcase}_BINDPATH+=",${HOME}/#{relocated_home_dir}"
+
+              # Session directory, and session directory in the relocated home
+              SESSION_DIR="$(pwd)"
+              RELOCATED_SESSION_DIR="${HOME}/#{relocated_home_dir}/$(realpath -m --relative-to="$HOME" "$SESSION_DIR")"
+
+              # Need to bind mount in the VNC session directory because it's needed
+              # within the container instance (for running the vnc server). This requires
+              # us to make the same directory within the relocated home so that we can
+              # bind mount into it
+              VNC_SESSION_DIR="${SESSION_DIR}/#{vnc_session_dir}"
+              RELOCATED_VNC_SESSION_DIR="${RELOCATED_SESSION_DIR}/#{vnc_session_dir}"
+              mkdir "$VNC_SESSION_DIR"
+              mkdir -p "$RELOCATED_SESSION_DIR"
+              export #{container_command.upcase}_BINDPATH+=",${VNC_SESSION_DIR}"
 
               # Setup one-time use passwords and initialize the VNC password
               function change_passwd () {
@@ -110,12 +138,11 @@ module OodCore
                 spassword=${spassword:-$(create_passwd "#{password_size}")}
                 (
                   umask 077
-                  echo -ne "${password}\\n${spassword}" | #{container_command} exec instance://#{@instance_name} vncpasswd -f > "#{vnc_passwd}"
+                  echo -ne "${password}\\n${spassword}" | #{container_command} exec --cleanenv instance://#{@instance_name} vncpasswd -f > "#{vnc_passwd}"
                 )
               }
               change_passwd
 
-              
               # Start up vnc server (if at first you don't succeed, try, try again)
               echo "Starting VNC server..."
               for i in $(seq 1 10); do
@@ -123,7 +150,7 @@ module OodCore
                 #{vnc_clean}
 
                 # for turbovnc 3.0 compatability.
-                if timeout 2 #{container_command} exec instance://#{@instance_name} vncserver --help 2>&1 | grep 'nohttpd' >/dev/null 2>&1; then
+                if timeout 2 #{container_command} exec --cleanenv instance://#{@instance_name} vncserver --help 2>&1 | grep 'nohttpd' >/dev/null 2>&1; then
                   HTTPD_OPT='-nohttpd'
                 fi
 
@@ -176,7 +203,7 @@ module OodCore
               echo "Starting websocket server..."
               websocket=$(find_port)
               [ $? -eq 0 ] || clean_up 1 # give up if port not found
-              #{container_command} exec instance://#{@instance_name} #{websockify_cmd} -D ${websocket} localhost:${port}
+              #{container_command} exec --cleanenv instance://#{@instance_name} #{websockify_cmd} -D ${websocket} localhost:${port}
 
               # Set up background process that scans the log file for successful
               # connections by users, and change the password after every
@@ -205,19 +232,19 @@ module OodCore
 
           # Log file for VNC server
           def vnc_log
-            context.fetch(:vnc_log, "vnc.log").to_s
+            context.fetch(:vnc_session_dir).to_s + "/" + context.fetch(:vnc_log, "vnc.log").to_s
           end
 
           # Password file for VNC server
           def vnc_passwd
-            context.fetch(:vnc_passwd, "vnc.passwd").to_s
+            context.fetch(:vnc_session_dir).to_s + "/" + context.fetch(:vnc_passwd, "vnc.passwd").to_s
           end
 
-          def container_module 
+          def container_module
             context.fetch(:container_module, "singularity").to_s
           end
 
-          def container_command 
+          def container_command
             context.fetch(:container_command, "singularity").to_s
           end
 
@@ -250,7 +277,7 @@ module OodCore
           # Clean up any stale VNC sessions
           def vnc_clean
             context.fetch(:vnc_clean) do
-              %(#{container_command} exec instance://#{@instance_name} vncserver -list | awk '/^:/{system("kill -0 "$2" 2>/dev/null || #{container_command} exec instance://#{@instance_name} vncserver -kill "$1)}')
+              %(#{container_command} exec --cleanenv instance://#{@instance_name} vncserver -list | awk '/^:/{system("kill -0 "$2" 2>/dev/null || #{container_command} exec --cleanenv instance://#{@instance_name} vncserver -kill "$1)}')
             end.to_s
           end
       end
